@@ -1,0 +1,7 @@
+streamlit>=1.24.0
+openai>=0.27.0
+packaging>=21.0
+tiktoken>=0.4.0
+cohere>=5.0.0
+python-dotenv>=1.0.0
+fastmcp>=0.1.0
