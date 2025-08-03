@@ -11,9 +11,133 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Iterator, Tuple, Optional, Any
 from dotenv import load_dotenv
 from fastmcp import Client
+from enum import Enum
+from dataclasses import dataclass, asdict
+import subprocess
+import stat
+import tempfile
 
 # Load environment variables
 load_dotenv()
+
+# Asyncio Event Loop Helper
+def run_async_in_streamlit(coro):
+    """Safely run async functions in Streamlit environment"""
+    try:
+        # Try to get the current event loop
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If loop is already running, we can't use run_until_complete
+            # This is common in Jupyter/Streamlit environments
+            try:
+                import nest_asyncio
+                nest_asyncio.apply()
+                return loop.run_until_complete(coro)
+            except ImportError:
+                st.warning("nest_asyncio not available, trying alternative approach")
+                # Create a new thread to run the async function
+                import concurrent.futures
+                import threading
+                
+                def run_in_thread():
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+                    try:
+                        return new_loop.run_until_complete(coro)
+                    finally:
+                        new_loop.close()
+                
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(run_in_thread)
+                    return future.result()
+        else:
+            return loop.run_until_complete(coro)
+    except RuntimeError:
+        # No event loop exists, create a new one
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            # Don't close the loop as it might be needed for other operations
+            pass
+    except Exception as e:
+        st.error(f"Event loop error: {str(e)}")
+        # Fallback: create a completely new event loop
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            pass
+
+# Transport Protocol Enums and Configuration Classes
+class TransportProtocol(Enum):
+    STDIO = "stdio"
+    HTTP = "http"
+    WEBSOCKET = "websocket"
+    SERVER_CONFIG = "server_config"
+
+@dataclass
+class ServerConfig:
+    name: str
+    transport: TransportProtocol
+    config: Dict[str, Any]
+    
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "transport": self.transport.value,
+            "config": self.config
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]):
+        return cls(
+            name=data["name"],
+            transport=TransportProtocol(data["transport"]),
+            config=data["config"]
+        )
+
+@dataclass
+class StdioConfig:
+    command: str
+    args: List[str] = None
+    env: Dict[str, str] = None
+    working_dir: str = None
+    
+    def __post_init__(self):
+        if self.args is None:
+            self.args = []
+        if self.env is None:
+            self.env = {}
+
+@dataclass
+class HttpConfig:
+    url: str
+    headers: Dict[str, str] = None
+    timeout: int = 30
+    verify_ssl: bool = True
+    
+    def __post_init__(self):
+        if self.headers is None:
+            self.headers = {}
+
+@dataclass
+class WebSocketConfig:
+    url: str
+    headers: Dict[str, str] = None
+    timeout: int = 30
+    ping_interval: int = 20
+    
+    def __post_init__(self):
+        if self.headers is None:
+            self.headers = {}
+
+@dataclass
+class ServerConfigReference:
+    config_name: str
+    config_path: str = "servers_config.json"
 
 # Configure MCP logging
 def setup_mcp_logging():
@@ -190,7 +314,283 @@ class MCPManager:
         self.clients: Dict[str, Client] = {}
         self.tools_cache: Dict[str, List[Dict]] = {}
         self.resources_cache: Dict[str, List[Dict]] = {}
+        self.server_configs: Dict[str, ServerConfig] = {}
+        self.connection_status: Dict[str, str] = {}
         
+    async def add_server_with_config(self, server_config: ServerConfig) -> bool:
+        """Add a new MCP server using ServerConfig object"""
+        try:
+            # Validate inputs
+            if not server_config.name:
+                st.error("Server name is required")
+                return False
+            
+            # Check if server name already exists
+            if server_config.name in self.clients:
+                st.error(f"Server with name '{server_config.name}' already exists")
+                return False
+            
+            client = await self._create_client_from_config(server_config)
+            if not client:
+                return False
+            
+            # Test connection and cache tools/resources with timeout
+            try:
+                async with client:
+                    tools = await client.list_tools()
+                    resources = await client.list_resources()
+                
+                    # Safely convert to dict
+                    self.tools_cache[server_config.name] = []
+                    self.resources_cache[server_config.name] = []
+                    
+                    for tool in tools:
+                        try:
+                            self.tools_cache[server_config.name].append(tool.model_dump())
+                        except Exception:
+                            # Fallback for tools that can't be dumped
+                            self.tools_cache[server_config.name].append({
+                                "name": getattr(tool, 'name', 'unknown'),
+                                "description": getattr(tool, 'description', ''),
+                                "server": server_config.name
+                            })
+                    
+                    for resource in resources:
+                        try:
+                            self.resources_cache[server_config.name].append(resource.model_dump())
+                        except Exception:
+                            # Fallback for resources that can't be dumped
+                            self.resources_cache[server_config.name].append({
+                                "name": getattr(resource, 'name', 'unknown'),
+                                "description": getattr(resource, 'description', ''),
+                                "server": server_config.name
+                            })
+                
+                self.clients[server_config.name] = client
+                self.server_configs[server_config.name] = server_config
+                self.connection_status[server_config.name] = "connected"
+                return True
+                
+            except Exception as connection_error:
+                st.error(f"Connection test failed: {str(connection_error)}")
+                self.connection_status[server_config.name] = "connection_error"
+                return False
+            
+        except ConnectionError as e:
+            self.connection_status[server_config.name] = "connection_error"
+            st.error(f"Connection failed for server '{server_config.name}': {str(e)}")
+            return False
+        except TimeoutError as e:
+            self.connection_status[server_config.name] = "timeout"
+            st.error(f"Connection timeout for server '{server_config.name}': {str(e)}")
+            return False
+        except Exception as e:
+            self.connection_status[server_config.name] = "error"
+            st.error(f"Failed to connect to MCP server '{server_config.name}': {str(e)}")
+            return False
+    
+    async def _create_client_from_config(self, server_config: ServerConfig) -> Optional[Client]:
+        """Create a FastMCP Client based on the server configuration"""
+        try:
+            if server_config.transport == TransportProtocol.HTTP:
+                http_config = HttpConfig(**server_config.config)
+                return Client(http_config.url)
+            
+            elif server_config.transport == TransportProtocol.STDIO:
+                stdio_config = StdioConfig(**server_config.config)
+                
+                # Create a Python wrapper script that FastMCP can understand
+                full_command = [stdio_config.command] + stdio_config.args
+                
+                # Build environment variables dict
+                env_vars = {}
+                if stdio_config.env:
+                    env_vars.update(stdio_config.env)
+                
+                # Create Python wrapper script
+                wrapper_content = f"""#!/usr/bin/env python3
+import subprocess
+import os
+import sys
+
+# Set environment variables
+env = os.environ.copy()
+env.update({repr(env_vars)})
+
+# Change working directory if specified
+working_dir = {repr(stdio_config.working_dir)}
+if working_dir:
+    os.chdir(working_dir)
+
+# Build command
+command = {repr(full_command)}
+
+# Execute the command
+try:
+    result = subprocess.run(command, env=env, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
+    sys.exit(result.returncode)
+except Exception as e:
+    print(f"Error executing command: {{e}}", file=sys.stderr)
+    sys.exit(1)
+"""
+                
+                # Write to temporary Python file
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                    f.write(wrapper_content)
+                    wrapper_path = f.name
+                
+                # Make executable
+                os.chmod(wrapper_path, stat.S_IRWXU)
+                
+                return Client(wrapper_path)
+            
+            elif server_config.transport == TransportProtocol.WEBSOCKET:
+                ws_config = WebSocketConfig(**server_config.config)
+                return Client(ws_config.url)
+            
+            elif server_config.transport == TransportProtocol.SERVER_CONFIG:
+                config_ref = ServerConfigReference(**server_config.config)
+                # Load from external config file
+                return await self._create_client_from_server_config(config_ref)
+            
+            # Try value-based comparison as fallback
+            elif hasattr(server_config.transport, 'value'):
+                transport_value = server_config.transport.value
+                
+                if transport_value == "stdio":
+                    stdio_config = StdioConfig(**server_config.config)
+                    
+                    # Create Python wrapper script (same as above)
+                    full_command = [stdio_config.command] + stdio_config.args
+                    env_vars = {}
+                    if stdio_config.env:
+                        env_vars.update(stdio_config.env)
+                    
+                    wrapper_content = f"""#!/usr/bin/env python3
+import subprocess
+import os
+import sys
+
+# Set environment variables
+env = os.environ.copy()
+env.update({repr(env_vars)})
+
+# Change working directory if specified
+working_dir = {repr(stdio_config.working_dir)}
+if working_dir:
+    os.chdir(working_dir)
+
+# Build command
+command = {repr(full_command)}
+
+# Execute the command
+try:
+    result = subprocess.run(command, env=env, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
+    sys.exit(result.returncode)
+except Exception as e:
+    print(f"Error executing command: {{e}}", file=sys.stderr)
+    sys.exit(1)
+"""
+                    
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                        f.write(wrapper_content)
+                        wrapper_path = f.name
+                    
+                    os.chmod(wrapper_path, stat.S_IRWXU)
+                    return Client(wrapper_path)
+                
+                elif transport_value == "http":
+                    http_config = HttpConfig(**server_config.config)
+                    return Client(http_config.url)
+                
+                elif transport_value == "websocket":
+                    ws_config = WebSocketConfig(**server_config.config)
+                    return Client(ws_config.url)
+                
+                elif transport_value == "server_config":
+                    config_ref = ServerConfigReference(**server_config.config)
+                    return await self._create_client_from_server_config(config_ref)
+                
+                else:
+                    st.error(f"❌ Unsupported transport value: {transport_value}")
+                    return None
+            
+            else:
+                st.error(f"❌ Unsupported transport protocol: {server_config.transport} (no value attribute)")
+                st.error(f"❌ Transport type: {type(server_config.transport)}")
+                st.error(f"❌ Available protocols: {list(TransportProtocol)}")
+                return None
+                
+        except Exception as e:
+            st.error(f"Error creating client: {str(e)}")
+            return None
+    
+    async def _create_client_from_server_config(self, config_ref: ServerConfigReference) -> Optional[Client]:
+        """Create client from external server config file"""
+        try:
+            config_path = config_ref.config_path
+            if not os.path.exists(config_path):
+                st.error(f"Server config file not found: {config_path}")
+                return None
+            
+            with open(config_path, 'r') as f:
+                config_data = json.load(f)
+            
+            if 'mcpServers' not in config_data:
+                st.error("Invalid server config format: missing 'mcpServers'")
+                return None
+            
+            server_data = config_data['mcpServers'].get(config_ref.config_name)
+            if not server_data:
+                st.error(f"Server '{config_ref.config_name}' not found in config")
+                return None
+            
+            # Create a temporary script that runs the command
+            
+            command = server_data.get('command', '')
+            args = server_data.get('args', [])
+            env_vars = server_data.get('env', {})
+            
+            # For now, we'll treat server config as stdio transport
+            full_command = [command] + args
+            
+            # Create a temporary wrapper script
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                f.write(f"""
+import subprocess
+import os
+import sys
+
+# Set environment variables
+env = os.environ.copy()
+env.update({repr(env_vars)})
+
+# Run the command
+subprocess.run({repr(full_command)}, env=env)
+""")
+                temp_script = f.name
+            
+            return Client(temp_script)
+            
+        except Exception as e:
+            st.error(f"Error loading server config: {str(e)}")
+            return None
+    
+    async def test_connection(self, server_config: ServerConfig) -> bool:
+        """Test connection to a server without adding it permanently"""
+        try:
+            client = await self._create_client_from_config(server_config)
+            if not client:
+                return False
+            
+            async with client:
+                await client.ping()
+                return True
+                
+        except Exception as e:
+            st.error(f"Connection test failed: {str(e)}")
+            return False
+    
     async def add_server(self, name: str, server_url_or_path: str) -> bool:
         """Add a new MCP server connection"""
         try:
@@ -258,6 +658,59 @@ class MCPManager:
             del self.tools_cache[name]
         if name in self.resources_cache:
             del self.resources_cache[name]
+        if name in self.server_configs:
+            del self.server_configs[name]
+        if name in self.connection_status:
+            del self.connection_status[name]
+    
+    def get_server_config(self, name: str) -> Optional[ServerConfig]:
+        """Get server configuration by name"""
+        return self.server_configs.get(name)
+    
+    def get_connection_status(self, name: str) -> str:
+        """Get connection status for a server"""
+        return self.connection_status.get(name, "unknown")
+    
+    def export_server_configs(self) -> Dict[str, Any]:
+        """Export all server configurations to a dictionary"""
+        return {
+            name: config.to_dict() 
+            for name, config in self.server_configs.items()
+        }
+    
+    def import_server_configs(self, configs_data: Dict[str, Any]):
+        """Import server configurations from a dictionary"""
+        for name, config_data in configs_data.items():
+            try:
+                config = ServerConfig.from_dict(config_data)
+                self.server_configs[name] = config
+            except Exception as e:
+                st.warning(f"Failed to import config for '{name}': {str(e)}")
+    
+    async def load_predefined_servers(self, config_path: str = "../mcp-aggregator/servers_config.json"):
+        """Load servers from the aggregator's config file"""
+        try:
+            if not os.path.exists(config_path):
+                return []
+            
+            with open(config_path, 'r') as f:
+                config_data = json.load(f)
+            
+            available_servers = []
+            if 'mcpServers' in config_data:
+                for server_name, server_data in config_data['mcpServers'].items():
+                    available_servers.append({
+                        'name': server_name,
+                        'command': server_data.get('command', ''),
+                        'args': server_data.get('args', []),
+                        'env': server_data.get('env', {})
+                    })
+            
+            return available_servers
+            
+        except Exception as e:
+            st.warning(f"Failed to load predefined servers: {str(e)}")
+            return []
     
     async def execute_tool(self, server_name: str, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a tool on a specific MCP server"""
@@ -393,10 +846,7 @@ def handle_tool_calls_with_openai(client, messages: List[Dict], model: str, tool
                 arguments = {}
             
             # Execute the MCP tool
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(execute_mcp_tool(tool_name, arguments, mcp_manager))
-            loop.close()
+            result = run_async_in_streamlit(execute_mcp_tool(tool_name, arguments, mcp_manager))
             
             # Add tool result to messages
             messages.append({
@@ -635,64 +1085,550 @@ else:  # Chat page
         st.session_state.mcp_enabled = mcp_enabled
     
         if mcp_enabled:
-            # Add new server section
+            # Add new server section with enhanced configuration
             with st.expander("➕ Add MCP Server", expanded=False):
-                with st.form("add_mcp_server"):
-                    server_name = st.text_input("Server Name", placeholder="e.g., My Local Server")
-                    server_url = st.text_input("Server URL/Path", placeholder="e.g., http://localhost:8000 or path/to/server.py")
+                # Server addition method selector
+                add_method = st.radio(
+                    "How would you like to add a server?",
+                    options=["Manual Configuration", "Load from File"],
+                    horizontal=True,
+                    help="Choose to manually configure a server or load from an exported configuration file"
+                )
+                
+                if add_method == "Load from File":
+                    # File uploader for loading individual server configs
+                    st.subheader("📁 Load Server Configuration")
+                    uploaded_file = st.file_uploader(
+                        "Choose configuration file",
+                        type=['json'],
+                        help="Upload a JSON file with exported server configurations",
+                        key="individual_config_upload"
+                    )
                     
-                    if st.form_submit_button("Add Server"):
-                        if server_name and server_url:
-                            # Use asyncio to run the async function
-                            try:
-                                # Create a new event loop if none exists
-                                loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(loop)
-                                success = loop.run_until_complete(
-                                    st.session_state.mcp_manager.add_server(server_name, server_url)
-                                )
-                                loop.close()
+                    if uploaded_file is not None:
+                        try:
+                            configs_data = json.load(uploaded_file)
+                            
+                            if not configs_data:
+                                st.warning("No server configurations found in file")
+                            else:
+                                st.success(f"Found {len(configs_data)} server configuration(s)")
                                 
-                                if success:
-                                    st.session_state.mcp_servers.append({
-                                        "name": server_name,
-                                        "url": server_url,
-                                        "status": "connected"
-                                    })
+                                # Show preview of servers to load
+                                with st.expander("📋 Preview Configurations", expanded=True):
+                                    for server_name, config_data in configs_data.items():
+                                        col1, col2 = st.columns([3, 1])
+                                        with col1:
+                                            transport_type = config_data.get('transport', 'unknown')
+                                            st.write(f"**{server_name}** ({transport_type})")
+                                            
+                                            # Show brief config details
+                                            if transport_type == "stdio":
+                                                cmd = config_data.get('config', {}).get('command', 'N/A')
+                                                st.caption(f"Command: {cmd}")
+                                            elif transport_type in ["http", "websocket"]:
+                                                url = config_data.get('config', {}).get('url', 'N/A')
+                                                st.caption(f"URL: {url}")
+                                        
+                                        with col2:
+                                            # Check if server already exists
+                                            if server_name in st.session_state.mcp_manager.clients:
+                                                st.caption("🟡 Exists")
+                                            else:
+                                                st.caption("🟢 New")
+                                
+                                if st.button("🚀 Load All Servers", type="primary", key="load_all_from_file"):
+                                    loaded_count = 0
+                                    failed_count = 0
+                                    
+                                    with st.spinner("Loading and connecting to servers..."):
+                                        for server_name, config_data in configs_data.items():
+                                            try:
+                                                # Create ServerConfig from loaded data
+                                                server_config = ServerConfig.from_dict(config_data)
+                                                
+                                                # Skip if server already exists
+                                                if server_name in st.session_state.mcp_manager.clients:
+                                                    st.warning(f"Server '{server_name}' already exists, skipping")
+                                                    continue
+                                                
+                                                # Add server with configuration
+                                                success = run_async_in_streamlit(
+                                                    st.session_state.mcp_manager.add_server_with_config(server_config)
+                                                )
+                                                
+                                                if success:
+                                                    # Update session state
+                                                    st.session_state.mcp_servers.append({
+                                                        "name": server_name,
+                                                        "transport": server_config.transport.value,
+                                                        "config": server_config.config,
+                                                        "status": "connected"
+                                                    })
+                                                    loaded_count += 1
+                                                else:
+                                                    failed_count += 1
+                                                    
+                                            except Exception as e:
+                                                st.warning(f"Failed to load server '{server_name}': {str(e)}")
+                                                failed_count += 1
+                                    
+                                    # Update available tools
                                     st.session_state.available_tools = st.session_state.mcp_manager.get_all_tools()
-                                    st.success(f"Successfully added server: {server_name}")
+                                    
+                                    # Show results
+                                    if loaded_count > 0:
+                                        st.success(f"Successfully loaded {loaded_count} server(s)!")
+                                    if failed_count > 0:
+                                        st.warning(f"Failed to load {failed_count} server(s)")
+                                    
                                     st.rerun()
-                                else:
-                                    st.error(f"Failed to add server: {server_name}")
-                            except Exception as e:
-                                st.error(f"Error adding server: {str(e)}")
-                        else:
-                            st.warning("Please provide both server name and URL/path")
+                                        
+                        except Exception as e:
+                            st.error(f"Failed to parse configuration file: {str(e)}")
+                
+                else:  # Manual Configuration
+                    # Transport protocol selector
+                    transport_protocol = st.selectbox(
+                        "Transport Protocol",
+                        options=[protocol.value for protocol in TransportProtocol],
+                        format_func=lambda x: {
+                            "stdio": "📡 STDIO (Local Scripts/Commands)",
+                            "http": "🌐 HTTP/HTTPS (Remote Servers)",
+                            "websocket": "🔌 WebSocket (Real-time)",
+                            "server_config": "⚙️ Server Config (Predefined)"
+                        }.get(x, x),
+                        help="Select the transport protocol for connecting to the MCP server"
+                    )
+                
+                    with st.form("add_mcp_server"):
+                        server_name = st.text_input("Server Name", placeholder="e.g., My Local Server")
+                        
+                        # Protocol-specific configuration
+                        if transport_protocol == "stdio":
+                            st.subheader("📡 STDIO Configuration")
+                            st.info("💡 **For interpreters (python, uvx, node):** Put the script/package as the first argument\n**For direct executables:** Use the executable name as command")
+                            
+                            command = st.text_input("Command", placeholder="e.g., uvx, python3, node, ./my-server")
+                            args_text = st.text_area("Arguments (one per line)", placeholder="mcp-neo4j-cypher@0.3.0\n--transport\nstdio")
+                            env_text = st.text_area("Environment Variables (KEY=VALUE, one per line)", placeholder="NEO4J_URI=bolt://localhost:7687\nNEO4J_USERNAME=neo4j\nNEO4J_PASSWORD=password")
+                            working_dir = st.text_input("Working Directory (optional)", placeholder="/path/to/server")
+                            
+                            # Show example configurations
+                            with st.expander("📖 Examples", expanded=False):
+                                st.code("""# Example 1: uvx with package
+Command: uvx
+Arguments:
+  mcp-neo4j-cypher@0.3.0
+  --transport
+  stdio
+
+# Example 2: Python script
+Command: python3
+Arguments:
+  my_mcp_server.py
+  --port
+  8080
+
+# Example 3: Direct executable
+Command: ./my-mcp-server
+Arguments:
+  --config
+  config.json""", language="text")
+                            
+                            # Parse arguments and environment
+                            args = [arg.strip() for arg in args_text.split('\n') if arg.strip()] if args_text else []
+                            env = {}
+                            if env_text:
+                                for line in env_text.split('\n'):
+                                    if '=' in line:
+                                        key, value = line.split('=', 1)
+                                        env[key.strip()] = value.strip()
+                            
+                            config = {
+                                "command": command,
+                                "args": args,
+                                "env": env,
+                                "working_dir": working_dir if working_dir else None
+                            }
+                    
+                        elif transport_protocol == "http":
+                            st.subheader("🌐 HTTP/HTTPS Configuration")
+                            url = st.text_input("Server URL", placeholder="http://localhost:8000/mcp or https://api.example.com/mcp")
+                            timeout = st.number_input("Timeout (seconds)", min_value=1, max_value=300, value=30)
+                            verify_ssl = st.checkbox("Verify SSL Certificate", value=True)
+                            
+                            # Headers configuration
+                            st.write("**Headers (optional):**")
+                            headers_text = st.text_area("Headers (KEY: VALUE, one per line)", placeholder="Authorization: Bearer token123\nContent-Type: application/json")
+                            headers = {}
+                            if headers_text:
+                                for line in headers_text.split('\n'):
+                                    if ':' in line:
+                                        key, value = line.split(':', 1)
+                                        headers[key.strip()] = value.strip()
+                            
+                            config = {
+                                "url": url,
+                                "headers": headers,
+                                "timeout": timeout,
+                                "verify_ssl": verify_ssl
+                            }
+                        
+                        elif transport_protocol == "websocket":
+                            st.subheader("🔌 WebSocket Configuration")
+                            url = st.text_input("WebSocket URL", placeholder="ws://localhost:8080/mcp or wss://api.example.com/mcp")
+                            timeout = st.number_input("Timeout (seconds)", min_value=1, max_value=300, value=30)
+                            ping_interval = st.number_input("Ping Interval (seconds)", min_value=1, max_value=120, value=20)
+                            
+                            # Headers configuration
+                            st.write("**Headers (optional):**")
+                            headers_text = st.text_area("Headers (KEY: VALUE, one per line)", placeholder="Authorization: Bearer token123")
+                            headers = {}
+                            if headers_text:
+                                for line in headers_text.split('\n'):
+                                    if ':' in line:
+                                        key, value = line.split(':', 1)
+                                        headers[key.strip()] = value.strip()
+                            
+                            config = {
+                                "url": url,
+                                "headers": headers,
+                                "timeout": timeout,
+                                "ping_interval": ping_interval
+                            }
+                    
+                        elif transport_protocol == "server_config":
+                            st.subheader("⚙️ Server Config Reference")
+                            
+                            # Load available predefined servers
+                            if 'predefined_servers' not in st.session_state:
+                                st.session_state.predefined_servers = run_async_in_streamlit(
+                                    st.session_state.mcp_manager.load_predefined_servers()
+                                )
+                            
+                            if st.session_state.predefined_servers:
+                                config_name = st.selectbox(
+                                    "Select Predefined Server",
+                                    options=[server['name'] for server in st.session_state.predefined_servers],
+                                    help="Choose from predefined servers in the aggregator config"
+                                )
+                                
+                                # Show selected server details
+                                selected_server = next(
+                                    (s for s in st.session_state.predefined_servers if s['name'] == config_name), 
+                                    None
+                                )
+                                if selected_server:
+                                    st.info(f"**Command:** {selected_server['command']}")
+                                    if selected_server['args']:
+                                        st.info(f"**Args:** {' '.join(selected_server['args'])}")
+                                    if selected_server['env']:
+                                        st.info(f"**Environment:** {len(selected_server['env'])} variables")
+                            else:
+                                config_name = st.text_input("Server Config Name", placeholder="neo4j")
+                                st.warning("No predefined servers found. Make sure the aggregator config file exists.")
+                            
+                            config_path = st.text_input("Config File Path", value="../mcp-aggregator/servers_config.json")
+                            
+                            config = {
+                                "config_name": config_name,
+                                "config_path": config_path
+                            }
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            test_connection = st.form_submit_button("🔍 Test Connection", type="secondary")
+                        with col2:
+                            add_server = st.form_submit_button("➕ Add Server", type="primary")
+                        
+                        # Handle form submissions
+                        if test_connection or add_server:
+                            if not server_name:
+                                st.error("Please provide a server name")
+                            elif transport_protocol == "stdio" and not command:
+                                st.error("Please provide a command")
+                            elif transport_protocol in ["http", "websocket"] and not config.get("url"):
+                                st.error("Please provide a URL")
+                            elif transport_protocol == "server_config" and not config.get("config_name"):
+                                st.error("Please select or provide a config name")
+                            else:
+                                # Create server config
+                                try:
+                                    transport_enum = TransportProtocol(transport_protocol)
+                                except Exception as e:
+                                    st.error(f"❌ Failed to create TransportProtocol enum: {e}")
+                                    st.error(f"❌ Available values: {[e.value for e in TransportProtocol]}")
+                                    st.stop()
+                                
+                                server_config = ServerConfig(
+                                    name=server_name,
+                                    transport=transport_enum,
+                                    config=config
+                                )
+                                
+                                if test_connection:
+                                    # Test connection only
+                                    with st.spinner("Testing connection..."):
+                                        try:
+                                            success = run_async_in_streamlit(
+                                                st.session_state.mcp_manager.test_connection(server_config)
+                                            )
+                                            if success:
+                                                st.success("✅ Connection test successful!")
+                                            else:
+                                                st.error("❌ Connection test failed")
+                                        except Exception as e:
+                                            st.error(f"❌ Connection test error: {str(e)}")
+                                
+                                elif add_server:
+                                    # Add server permanently
+                                    with st.spinner("Adding server..."):
+                                        try:
+                                            success = run_async_in_streamlit(
+                                                st.session_state.mcp_manager.add_server_with_config(server_config)
+                                            )
+                                            if success:
+                                                # Update session state
+                                                st.session_state.mcp_servers.append({
+                                                    "name": server_name,
+                                                    "transport": transport_protocol,
+                                                    "config": config,
+                                                    "status": "connected"
+                                                })
+                                                st.session_state.available_tools = st.session_state.mcp_manager.get_all_tools()
+                                                st.success(f"✅ Successfully added server: {server_name}")
+                                                st.rerun()
+                                            else:
+                                                st.error(f"❌ Failed to add server: {server_name}")
+                                        except Exception as e:
+                                            st.error(f"❌ Error adding server: {str(e)}")
         
             # Display connected servers
             if st.session_state.mcp_servers:
                 st.write("**Connected Servers:**")
                 for i, server in enumerate(st.session_state.mcp_servers):
-                    col1, col2 = st.columns([3, 1])
-                    with col1:
-                        status_icon = "🟢" if server["status"] == "connected" else "🔴"
-                        st.write(f"{status_icon} {server['name']}")
-                        st.caption(server['url'])
-                    with col2:
-                        if st.button("❌", key=f"remove_server_{i}"):
-                            st.session_state.mcp_manager.remove_server(server['name'])
-                            st.session_state.mcp_servers.pop(i)
+                    # Get current connection status from manager
+                    current_status = st.session_state.mcp_manager.get_connection_status(server['name'])
+                    
+                    with st.container():
+                        col1, col2, col3 = st.columns([2, 1, 1])
+                        with col1:
+                            # Status icon with more detail
+                            status_icons = {
+                                "connected": "🟢",
+                                "connection_error": "🔴",
+                                "timeout": "🟡",
+                                "error": "🔴",
+                                "unknown": "⚪"
+                            }
+                            status_icon = status_icons.get(current_status, "⚪")
+                            
+                            # Transport protocol icon
+                            transport_icons = {
+                                "stdio": "📡",
+                                "http": "🌐",
+                                "websocket": "🔌",
+                                "server_config": "⚙️"
+                            }
+                            transport = server.get('transport', 'unknown')
+                            transport_icon = transport_icons.get(transport, "❓")
+                            
+                            st.write(f"{status_icon} {transport_icon} **{server['name']}**")
+                            
+                            # Show configuration details
+                            if transport == "stdio":
+                                config = server.get('config', {})
+                                command = config.get('command', 'Unknown')
+                                args = config.get('args', [])
+                                display_cmd = f"{command} {' '.join(args[:2])}" + ("..." if len(args) > 2 else "")
+                                st.caption(f"STDIO: {display_cmd}")
+                            elif transport in ["http", "websocket"]:
+                                url = server.get('config', {}).get('url', 'Unknown URL')
+                                st.caption(f"{transport.upper()}: {url}")
+                            elif transport == "server_config":
+                                config_name = server.get('config', {}).get('config_name', 'Unknown')
+                                st.caption(f"Config: {config_name}")
+                            else:
+                                # Fallback for old format
+                                url = server.get('url', 'Unknown')
+                                st.caption(f"Legacy: {url}")
+                        
+                        with col2:
+                            # Connection status badge
+                            status_colors = {
+                                "connected": "🟢 Connected",
+                                "connection_error": "🔴 Error",
+                                "timeout": "🟡 Timeout",
+                                "error": "🔴 Failed",
+                                "unknown": "⚪ Unknown"
+                            }
+                            st.caption(status_colors.get(current_status, "⚪ Unknown"))
+                        
+                        with col3:
+                            # Action buttons
+                            col3a, col3b = st.columns(2)
+                            with col3a:
+                                if st.button("🔄", key=f"refresh_server_{i}", help="Refresh connection"):
+                                    # Refresh server connection
+                                    try:
+                                        run_async_in_streamlit(
+                                            st.session_state.mcp_manager.refresh_tools_cache()
+                                        )
+                                        st.success(f"Refreshed {server['name']}")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Refresh failed: {str(e)}")
+                            
+                            with col3b:
+                                if st.button("❌", key=f"remove_server_{i}", help="Remove server"):
+                                    st.session_state.mcp_manager.remove_server(server['name'])
+                                    st.session_state.mcp_servers.pop(i)
+                                    st.session_state.available_tools = st.session_state.mcp_manager.get_all_tools()
+                                    st.rerun()
+                        
+                        st.divider()
+                
+                # Server management actions
+                st.markdown("**Server Management:**")
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    if st.button("📥 Export Configs", help="Export server configurations"):
+                        configs = st.session_state.mcp_manager.export_server_configs()
+                        if configs:
+                            st.json(configs)
+                            st.download_button(
+                                "💾 Download JSON",
+                                data=json.dumps(configs, indent=2),
+                                file_name="mcp_server_configs.json",
+                                mime="application/json"
+                            )
+                        else:
+                            st.info("No server configurations to export")
+                
+                with col2:
+                    # File uploader for importing configs
+                    uploaded_file = st.file_uploader(
+                        "📤 Load Configs",
+                        type=['json'],
+                        help="Load server configurations from exported JSON file"
+                    )
+                    if uploaded_file is not None:
+                        try:
+                            configs_data = json.load(uploaded_file)
+                            
+                            # Load each configuration and connect to servers
+                            loaded_count = 0
+                            failed_count = 0
+                            
+                            with st.spinner("Loading and connecting to servers..."):
+                                for server_name, config_data in configs_data.items():
+                                    try:
+                                        # Create ServerConfig from loaded data
+                                        server_config = ServerConfig.from_dict(config_data)
+                                        
+                                        # Skip if server already exists
+                                        if server_name in st.session_state.mcp_manager.clients:
+                                            st.warning(f"Server '{server_name}' already exists, skipping")
+                                            continue
+                                        
+                                        # Add server with configuration
+                                        success = run_async_in_streamlit(
+                                            st.session_state.mcp_manager.add_server_with_config(server_config)
+                                        )
+                                        
+                                        if success:
+                                            # Update session state
+                                            st.session_state.mcp_servers.append({
+                                                "name": server_name,
+                                                "transport": server_config.transport.value,
+                                                "config": server_config.config,
+                                                "status": "connected"
+                                            })
+                                            loaded_count += 1
+                                        else:
+                                            failed_count += 1
+                                            
+                                    except Exception as e:
+                                        st.warning(f"Failed to load server '{server_name}': {str(e)}")
+                                        failed_count += 1
+                            
+                            # Update available tools
                             st.session_state.available_tools = st.session_state.mcp_manager.get_all_tools()
+                            
+                            # Show results
+                            if loaded_count > 0:
+                                st.success(f"Successfully loaded {loaded_count} server configuration(s)!")
+                            if failed_count > 0:
+                                st.warning(f"Failed to load {failed_count} server configuration(s)")
+                            
                             st.rerun()
+                            
+                        except Exception as e:
+                            st.error(f"Failed to load configurations: {str(e)}")
+                
+                with col3:
+                    if st.button("🔄 Refresh All", help="Refresh all server connections"):
+                        with st.spinner("Refreshing all connections..."):
+                            try:
+                                run_async_in_streamlit(
+                                    st.session_state.mcp_manager.refresh_tools_cache()
+                                )
+                                st.session_state.available_tools = st.session_state.mcp_manager.get_all_tools()
+                                st.success("All connections refreshed!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Refresh failed: {str(e)}")
         
             # Display available tools
             if st.session_state.available_tools:
                 with st.expander(f"🛠️ Available Tools ({len(st.session_state.available_tools)})", expanded=False):
+                    # Group tools by server
+                    tools_by_server = {}
                     for tool in st.session_state.available_tools:
-                        st.write(f"**{tool['server']}.{tool['name']}**")
-                        if 'description' in tool:
-                            st.caption(tool['description'])
+                        server_name = tool['server']
+                        if server_name not in tools_by_server:
+                            tools_by_server[server_name] = []
+                        tools_by_server[server_name].append(tool)
+                    
+                    for server_name, tools in tools_by_server.items():
+                        # Get server transport icon
+                        server_info = next((s for s in st.session_state.mcp_servers if s['name'] == server_name), None)
+                        if server_info:
+                            transport = server_info.get('transport', 'unknown')
+                            transport_icons = {
+                                "stdio": "📡",
+                                "http": "🌐", 
+                                "websocket": "🔌",
+                                "server_config": "⚙️"
+                            }
+                            transport_icon = transport_icons.get(transport, "❓")
+                        else:
+                            transport_icon = "❓"
+                        
+                        st.write(f"**{transport_icon} {server_name}** ({len(tools)} tools)")
+                        
+                        for tool in tools:
+                            col1, col2 = st.columns([3, 1])
+                            with col1:
+                                st.write(f"  🔧 **{tool['name']}**")
+                                if 'description' in tool and tool['description']:
+                                    st.caption(f"  {tool['description']}")
+                            
+                            # Show input schema if available
+                            if 'inputSchema' in tool and tool['inputSchema']:
+                                with col2:
+                                    if st.button("📋", key=f"schema_{server_name}_{tool['name']}", help="Show schema"):
+                                        st.json(tool['inputSchema'])
+                        
                         st.divider()
+                    
+                    # Tools summary
+                    st.markdown("---")
+                    total_tools = len(st.session_state.available_tools)
+                    total_servers = len(tools_by_server)
+                    st.caption(f"📊 **Summary:** {total_tools} tools across {total_servers} servers")
     
         # Show total cost and provider info
         st.markdown("---")
@@ -829,4 +1765,3 @@ else:  # Chat page
 
     # Footer
     st.markdown("---")
-    st.markdown("*Powered by OpenAI and Streamlit*")

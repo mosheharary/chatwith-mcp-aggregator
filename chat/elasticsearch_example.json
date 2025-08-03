@@ -1,0 +1,25 @@
+{
+  "elastic": {
+    "name": "elastic",
+    "transport": "stdio",
+    "config": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "-e",
+        "ES_URL",
+        "-e",
+        "ES_API_KEY",
+        "docker.elastic.co/mcp/elasticsearch",
+        "stdio"
+      ],
+      "env": {
+        "ES_URL": "http://localhost:9200",
+        "ES_API_KEY": "none"
+      },
+      "working_dir": null
+    }
+  }
+}
